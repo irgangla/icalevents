@@ -11,6 +11,7 @@ from dateutil.rrule import rrule, rruleset, rrulestr
 from dateutil.tz import UTC, gettz
 
 from icalendar import Calendar
+from icalendar.windows_to_olson import WINDOWS_TO_OLSON
 from icalendar.prop import vDDDLists, vText
 from pytz import timezone
 
@@ -208,7 +209,8 @@ def create_event(component, tz=UTC):
     elif event.created:
         event.last_modified = event.created
 
-    if component.get('sequence'):
+    # sequence can be 0 - test for None instead
+    if not component.get('sequence') is None:
         event.sequence = component.get('sequence')
 
     if component.get("categories"):
@@ -267,6 +269,9 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
 
     # Keep track of the timezones defined in the calendar
     timezones = {}
+    if 'X-WR-TIMEZONE' in calendar:
+        timezones[str(calendar['X-WR-TIMEZONE'])] = gettz(str(calendar['X-WR-TIMEZONE']))
+
     for c in calendar.walk('VTIMEZONE'):
         name = str(c['TZID'])
         try:
@@ -282,6 +287,8 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
     # assume it applies globally, otherwise UTC
     if len(timezones) == 1:
         cal_tz = gettz(list(timezones)[0])
+        if not cal_tz and str(c['TZID']) in WINDOWS_TO_OLSON:
+            cal_tz = gettz(WINDOWS_TO_OLSON[str(c['TZID'])])
     else:
         cal_tz = UTC
 
@@ -289,12 +296,16 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
     end = normalize(end, cal_tz)
 
     found = []
+    recurrence_ids = []
 
     # Skip dates that are stored as exceptions.
     exceptions = {}
     for component in calendar.walk():
         if component.name == "VEVENT":
             e = create_event(component, cal_tz)
+            
+            if 'RECURRENCE-ID' in component:
+                recurrence_ids.append((e.uid, component['RECURRENCE-ID'].dt, e.sequence))
 
             if 'EXDATE' in component:
                 # Deal with the fact that sometimes it's a list and
@@ -313,8 +324,11 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
             # use it; otherwise, attempt to load the rules from pytz.
             start_tz = None
             end_tz = None
+            if e.all_day and e.recurring:
+                # Keep the timezone around if to apply later
+                start_tz = e.start.tzinfo
+                end_tz = e.end.tzinfo
 
-            if e.all_day:
                 # Start and end times for all day events must not have
                 # a timezone because the specification forbids the
                 # RRULE UNTIL from having a timezone. On the other
@@ -336,7 +350,7 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
                         start_tz = timezones[str(e.start.tzinfo)]
                     else:
                         try:
-                            start_tz = timezone(str(e.start.tzinfo))
+                            start_tz = e.start.tzinfo
                         except:
                             pass
 
@@ -345,7 +359,7 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
                         end_tz = timezones[str(e.end.tzinfo)]
                     else:
                         try:
-                            end_tz = timezone(str(e.end.tzinfo))
+                            end_tz = e.end.tzinfo
                         except:
                             pass
 
@@ -364,8 +378,7 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
             if e.recurring:
                 # Unfold recurring events according to their rrule
                 rule = parse_rrule(component, cal_tz)
-                dur = e.end - e.start
-                after = start - dur
+                after = start - duration
 
                 for dt in rule.between(after, end, inc=True):
                     if start_tz is None:
@@ -376,7 +389,7 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
                         # date of *this* occurrence. This handles the case where the
                         # recurrence has crossed over the daylight savings time boundary.
                         naive = datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
-                        dtstart = start_tz.localize(naive)
+                        dtstart = normalize(naive, tz=start_tz)
 
                         ecopy = e.copy_to(dtstart, e.uid)
 
@@ -394,7 +407,8 @@ def parse_events(content, start=None, end=None, default_span=timedelta(days=7)):
                 exdate = "%04d%02d%02d" % (e.start.year, e.start.month, e.start.day)
                 if exdate not in exceptions:
                     found.append(e)
-    return found
+    # Filter out all events that are moved as indicated by the recurrence-id prop
+    return [event for event in found if e.sequence is None or not (event.uid, event.start, e.sequence) in recurrence_ids]
 
 
 def parse_rrule(component, tz=UTC):
@@ -418,6 +432,11 @@ def parse_rrule(component, tz=UTC):
         if type(rdtstart) is datetime:
             rdtstart = normalize(rdtstart, tz=tz)
 
+        if type(rdtstart) is date:
+            for index, rru in enumerate(rrules):
+                if 'UNTIL' in rru:
+                    rrules[index]['UNTIL'] = [dt.date() if type(dt) is datetime else dt for dt in rru['UNTIL']]
+
         # Parse the rrules, might return a rruleset instance, instead of rrule
         rule = rrulestr('\n'.join(x.to_ical().decode() for x in rrules),
                         dtstart=rdtstart)
@@ -431,7 +450,7 @@ def parse_rrule(component, tz=UTC):
 
             # Add exdates to the rruleset
             for exd in extract_exdates(component):
-                rule.exdate(exd)
+                rule.exdate(exd.replace(tzinfo=None) if type(rdtstart) is date else exd)
 
         # TODO: What about rdates and exrules?
 
